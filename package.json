@@ -1,23 +1,26 @@
 {
-  "name": "loungelord",
+  "name": "loungelordofdiscord",
   "version": "1.0.0",
-  "description": "A polished Discord AI assistant bot with slash command + mention support.",
-  "main": "src/bot.js",
-  "type": "commonjs",
+  "description": "",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/bot.js",
-    "dev": "node --watch src/bot.js",
-    "register": "node src/register-commands.js"
+    "start": "node index.js",
+    "test": "node --check index.js"
   },
-  "keywords": [
-    "discord",
-    "bot",
-    "ai"
-  ],
-  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/melomike96/LoungeLordofDiscord.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/melomike96/LoungeLordofDiscord/issues"
+  },
+  "homepage": "https://github.com/melomike96/LoungeLordofDiscord#readme",
   "dependencies": {
-    "discord.js": "^14.19.2",
-    "dotenv": "^16.4.7",
-    "openai": "^4.95.1"
+    "discord.js": "^14.26.2",
+    "dotenv": "^17.4.0",
+    "openai": "^6.33.0"
   }
 }
