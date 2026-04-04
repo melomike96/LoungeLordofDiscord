@@ -1,0 +1,26 @@
+{
+  "name": "loungelordofdiscord",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --check index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/melomike96/LoungeLordofDiscord.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/melomike96/LoungeLordofDiscord/issues"
+  },
+  "homepage": "https://github.com/melomike96/LoungeLordofDiscord#readme",
+  "dependencies": {
+    "discord.js": "^14.26.2",
+    "dotenv": "^17.4.0",
+    "openai": "^6.33.0"
+  }
+}
