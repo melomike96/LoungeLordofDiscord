@@ -1,0 +1,23 @@
+{
+  "name": "loungelord",
+  "version": "1.0.0",
+  "description": "A polished Discord AI assistant bot with slash command + mention support.",
+  "main": "src/bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "node --watch src/bot.js",
+    "register": "node src/register-commands.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "ai"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.19.2",
+    "dotenv": "^16.4.7",
+    "openai": "^4.95.1"
+  }
+}
