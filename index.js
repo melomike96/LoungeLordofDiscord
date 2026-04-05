@@ -61,6 +61,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
 const SEARCH_MODEL = process.env.OPENAI_SEARCH_MODEL?.trim() || DEFAULT_MODEL;
 const USER_MEMORY_PATH = path.join(__dirname, 'user-memory.json');
+const OPENAI_LOGS_CHANNEL_ID = '1478534794810888326';
+const conversationMemory = new Map();
+const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const MAX_CONVERSATION_MESSAGES = 8;
 
 const SUBJECTS = ['general', 'history', 'science', 'tech', 'nutrition'];
 const SUBJECT_KEYWORDS = {
@@ -150,6 +154,9 @@ function buildSystemPrompt(subject, isMentionMode = false) {
   if (isMentionMode) {
     base.push('When the user mentions you naturally, infer the best subject automatically from their message.');
     base.push('Mention-mode replies should feel extra conversational, like a smart friend in the server.');
+    base.push('Use the recent conversation when it is available so follow-up questions keep their context.');
+    base.push('Resolve references like "that", "it", "that time period", or "what about then" from the prior turns when possible.');
+    base.push('Do not ask the user to restate obvious context you already have from the current conversation.');
   }
 
   base.push(subjectRules[subject] || subjectRules.general);
@@ -168,8 +175,89 @@ function inferSubjectFromPrompt(prompt = '') {
   return 'general';
 }
 
+function shouldResearchMention(prompt = '', conversationHistory = []) {
+  const lower = prompt.toLowerCase();
+  const recentContext = conversationHistory
+    .map(message => message.content)
+    .join(' ')
+    .toLowerCase();
+  const combined = `${recentContext} ${lower}`.trim();
+
+  const researchSignals = [
+    'when',
+    'where',
+    'who',
+    'why',
+    'how many',
+    'how much',
+    'how long',
+    'what happened',
+    'what else',
+    'time period',
+    'history',
+    'science',
+    'research',
+    'source',
+    'sources',
+    'evidence',
+    'study',
+    'studies',
+    'fact',
+    'facts',
+    'news',
+    'today',
+    'latest',
+    'current',
+    'caesar',
+    'rome',
+    'war',
+    'empire',
+    'killed',
+    'died',
+    'founded',
+    'invented',
+    'discovered',
+  ];
+
+  return researchSignals.some(signal => combined.includes(signal));
+}
+
 function getDisplayName(user, member) {
   return member?.displayName || user?.globalName || user?.username || 'there';
+}
+
+function getConversationKey({ guildId, channelId, userId }) {
+  return `${guildId}:${channelId}:${userId}`;
+}
+
+function getConversationHistory(key) {
+  const entry = conversationMemory.get(key);
+  if (!entry) return [];
+
+  if (Date.now() - entry.updatedAt > CONVERSATION_TTL_MS) {
+    conversationMemory.delete(key);
+    return [];
+  }
+
+  return entry.messages;
+}
+
+function saveConversationHistory(key, messages) {
+  conversationMemory.set(key, {
+    updatedAt: Date.now(),
+    messages: messages.slice(-MAX_CONVERSATION_MESSAGES),
+  });
+}
+
+function recordConversationTurn(key, userPrompt, assistantReply) {
+  const history = getConversationHistory(key);
+  const nextHistory = [
+    ...history,
+    { role: 'user', content: userPrompt },
+    { role: 'assistant', content: assistantReply },
+  ];
+
+  saveConversationHistory(key, nextHistory);
 }
 
 function getUserProfile(userId) {
@@ -218,31 +306,100 @@ function personalizeReply(text, displayName, historyComment = '') {
   return `${greeting} - ${historyComment} ${trimmed}`;
 }
 
+function getPersonalizedPrefixLength(displayName, historyComment = '') {
+  const greeting = `Hey ${displayName}`;
+  return historyComment
+    ? `${greeting} - ${historyComment} `.length
+    : `${greeting}, `.length;
+}
+
+function findChunkBreakpoint(slice) {
+  const preferredBreaks = [
+    '\n## ',
+    '\nSources:\n',
+    '\nSources:',
+    '\n\n- ',
+    '\n\n',
+    '. ',
+    '? ',
+    '! ',
+    '\n- ',
+    '\n',
+    '; ',
+    ', ',
+    ' ',
+  ];
+
+  for (const marker of preferredBreaks) {
+    const index = slice.lastIndexOf(marker);
+    if (index >= 0) {
+      return index + marker.length;
+    }
+  }
+
+  return -1;
+}
+
+function splitOversizedBlock(block, maxLength) {
+  const parts = [];
+  let remaining = block.trim();
+
+  while (remaining.length > maxLength) {
+    const slice = remaining.slice(0, maxLength);
+    const breakpoint = findChunkBreakpoint(slice);
+    const splitAt = breakpoint > Math.floor(maxLength * 0.45) ? breakpoint : maxLength;
+
+    parts.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining.length) {
+    parts.push(remaining);
+  }
+
+  return parts;
+}
+
 function chunkText(text, maxLength = 1900) {
   if (!text) return ['Response was empty.'];
 
+  const normalized = text.trim();
+  const blocks = normalized
+    .split(/\n{2,}/)
+    .map(block => block.trim())
+    .filter(Boolean);
+
   const chunks = [];
-  let remaining = text.trim();
+  let currentChunk = '';
 
-  while (remaining.length > maxLength) {
-    let slice = remaining.slice(0, maxLength);
-    const lastBreak = Math.max(
-      slice.lastIndexOf('\n\n'),
-      slice.lastIndexOf('\n'),
-      slice.lastIndexOf('. '),
-      slice.lastIndexOf(' ')
-    );
+  for (const block of blocks) {
+    const candidate = currentChunk ? `${currentChunk}\n\n${block}` : block;
 
-    if (lastBreak > 200) {
-      slice = slice.slice(0, lastBreak + 1);
+    if (candidate.length <= maxLength) {
+      currentChunk = candidate;
+      continue;
     }
 
-    chunks.push(slice.trim());
-    remaining = remaining.slice(slice.length).trim();
+    if (currentChunk) {
+      chunks.push(currentChunk.trim());
+      currentChunk = '';
+    }
+
+    if (block.length <= maxLength) {
+      currentChunk = block;
+      continue;
+    }
+
+    const blockParts = splitOversizedBlock(block, maxLength);
+    chunks.push(...blockParts.slice(0, -1));
+    currentChunk = blockParts[blockParts.length - 1];
   }
 
-  if (remaining.length) chunks.push(remaining);
-  return chunks;
+  if (currentChunk) {
+    chunks.push(currentChunk.trim());
+  }
+
+  return chunks.length ? chunks : ['Response was empty.'];
 }
 
 function getUserFacingErrorMessage(error, context = 'request') {
@@ -271,6 +428,55 @@ function getUserFacingErrorMessage(error, context = 'request') {
   }
 
   return `Something broke while handling that ${context}. Check the bot logs for details.`;
+}
+
+function getUsageSummary(response) {
+  const usage = response?.usage || {};
+
+  return {
+    inputTokens: usage.input_tokens ?? 0,
+    outputTokens: usage.output_tokens ?? 0,
+    totalTokens:
+      usage.total_tokens ??
+      ((usage.input_tokens ?? 0) + (usage.output_tokens ?? 0)),
+    reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? 0,
+  };
+}
+
+function formatUsageLog({ context, response, userId, prompt }) {
+  const usage = getUsageSummary(response);
+  const promptPreview = (prompt || '').replace(/\s+/g, ' ').trim().slice(0, 180) || '(empty)';
+
+  return [
+    '**OpenAI API Usage**',
+    `Context: ${context}`,
+    `User: ${userId || 'unknown'}`,
+    `Model: ${response?.model || 'unknown'}`,
+    `Response ID: ${response?.id || 'unknown'}`,
+    `Input tokens: ${usage.inputTokens}`,
+    `Output tokens: ${usage.outputTokens}`,
+    `Total tokens: ${usage.totalTokens}`,
+    usage.reasoningTokens ? `Reasoning tokens: ${usage.reasoningTokens}` : null,
+    `Prompt: ${promptPreview}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function sendOpenAILog(payload) {
+  if (!client.isReady()) return;
+
+  try {
+    const channel = await client.channels.fetch(OPENAI_LOGS_CHANNEL_ID);
+    if (!channel?.isTextBased()) {
+      console.error('OpenAI logs channel is not text-based.');
+      return;
+    }
+
+    await channel.send(formatUsageLog(payload));
+  } catch (error) {
+    console.error('Failed to send OpenAI usage log:', error);
+  }
 }
 
 function isUnknownInteractionError(error) {
@@ -319,7 +525,7 @@ async function safeFollowUp(interaction, content) {
 
 async function checkOpenAIHealth() {
   try {
-    await openai.responses.create({
+    const response = await openai.responses.create({
       model: DEFAULT_MODEL,
       input: [
         {
@@ -330,6 +536,13 @@ async function checkOpenAIHealth() {
       max_output_tokens: 16,
     });
 
+    await sendOpenAILog({
+      context: 'health',
+      response,
+      userId: 'system',
+      prompt: 'Reply with exactly: OK',
+    });
+
     return { ok: true, message: 'OpenAI is reachable.' };
   } catch (error) {
     console.error('Health check error:', error);
@@ -337,7 +550,7 @@ async function checkOpenAIHealth() {
   }
 }
 
-async function createTextResponse({ model, input, tools, maxOutputTokens = 700 }) {
+async function createTextResponse({ model, input, tools, maxOutputTokens = 700, logContext }) {
   const response = await openai.responses.create({
     model,
     input,
@@ -345,10 +558,82 @@ async function createTextResponse({ model, input, tools, maxOutputTokens = 700 }
     max_output_tokens: maxOutputTokens,
   });
 
-  return response.output_text?.trim() || 'No response returned.';
+  await sendOpenAILog({
+    context: logContext?.context || 'unknown',
+    response,
+    userId: logContext?.userId,
+    prompt:
+      input?.find?.(item => item.role === 'user')?.content ||
+      logContext?.prompt ||
+      '',
+  });
+
+  return {
+    text: response.output_text?.trim() || 'No response returned.',
+    response,
+  };
 }
 
-async function askAI({ prompt, subject = 'general', mentionMode = false }) {
+function buildResearchSystemPrompt(subject) {
+  return [
+    'You are LoungeLord handling a researched Discord answer.',
+    'Use web search to gather reliable, relevant facts before answering.',
+    'Prioritize concrete facts, dates, names, numbers, and cause-and-effect over vibes or personal opinion.',
+    'If sources disagree or the evidence is incomplete, say that plainly and explain the uncertainty briefly.',
+    'Do not invent facts, sources, quotes, or confidence.',
+    'Answer in a clear, conversational tone, but keep the substance evidence-first and specific.',
+    'After the main answer, always include a section titled "Sources:" with 2 to 5 bullet points.',
+    'Each source bullet must include the source name and a direct URL.',
+    'Do not say you have no sources if you used web search; keep searching until you can cite relevant sources.',
+    `Subject focus: ${buildSystemPrompt(subject, false)}`,
+  ].join(' ');
+}
+
+function buildMentionResearchSystemPrompt(subject) {
+  return [
+    buildResearchSystemPrompt(subject),
+    'This is a natural Discord mention reply, so keep the tone conversational and not overly formal.',
+    'Use the recent conversation to resolve follow-up references before searching.',
+    'If the user is asking a factual follow-up, answer it directly instead of asking them to restate the prior topic.',
+  ].join(' ');
+}
+
+async function askAI({ prompt, subject = 'general', mentionMode = false, userId, conversationHistory = [] }) {
+  if (!mentionMode || shouldResearchMention(prompt, conversationHistory)) {
+    return createTextResponse({
+      model: SEARCH_MODEL,
+      input: [
+        {
+          role: 'system',
+          content: mentionMode
+            ? buildMentionResearchSystemPrompt(subject)
+            : buildResearchSystemPrompt(subject),
+        },
+        ...conversationHistory,
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+      tools: [
+        {
+          type: 'web_search',
+          user_location: {
+            type: 'approximate',
+            country: 'US',
+            timezone: 'America/New_York',
+          },
+        },
+      ],
+      maxOutputTokens: 1100,
+      logContext: {
+        context: mentionMode ? `mention-research:${subject}` : `/ask:${subject}`,
+        userId,
+        prompt,
+      },
+    });
+  }
+
   return createTextResponse({
     model: DEFAULT_MODEL,
     input: [
@@ -356,15 +641,21 @@ async function askAI({ prompt, subject = 'general', mentionMode = false }) {
         role: 'system',
         content: buildSystemPrompt(subject, mentionMode),
       },
+      ...conversationHistory,
       {
         role: 'user',
         content: prompt,
       },
     ],
+    logContext: {
+      context: `mention:${subject}`,
+      userId,
+      prompt,
+    },
   });
 }
 
-async function searchAI(prompt) {
+async function searchAI(prompt, userId) {
   return createTextResponse({
     model: SEARCH_MODEL,
     input: [
@@ -394,6 +685,11 @@ async function searchAI(prompt) {
       },
     ],
     maxOutputTokens: 900,
+    logContext: {
+      context: '/search',
+      userId,
+      prompt,
+    },
   });
 }
 
@@ -447,9 +743,11 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!deferred) return;
 
     try {
-      const text = await searchAI(prompt);
-      const chunks = chunkText(text);
-      const firstChunk = personalizeReply(chunks[0], displayName, buildHistoryComment('general', profile));
+      const { text } = await searchAI(prompt, interaction.user.id);
+      const historyComment = buildHistoryComment('general', profile);
+      const firstChunkMaxLength = 1900 - getPersonalizedPrefixLength(displayName, historyComment);
+      const chunks = chunkText(text, Math.max(1200, firstChunkMaxLength));
+      const firstChunk = personalizeReply(chunks[0], displayName, historyComment);
 
       await safeEditReply(interaction, firstChunk);
       for (let i = 1; i < chunks.length; i++) {
@@ -473,9 +771,16 @@ client.on(Events.InteractionCreate, async interaction => {
   if (!deferred) return;
 
   try {
-    const text = await askAI({ prompt, subject, mentionMode: false });
-    const chunks = chunkText(text);
-    const firstChunk = personalizeReply(chunks[0], displayName, buildHistoryComment(subject, profile));
+    const { text } = await askAI({
+      prompt,
+      subject,
+      mentionMode: false,
+      userId: interaction.user.id,
+    });
+      const historyComment = buildHistoryComment(subject, profile);
+      const firstChunkMaxLength = 1900 - getPersonalizedPrefixLength(displayName, historyComment);
+      const chunks = chunkText(text, Math.max(1200, firstChunkMaxLength));
+      const firstChunk = personalizeReply(chunks[0], displayName, historyComment);
 
     await safeEditReply(interaction, firstChunk);
     for (let i = 1; i < chunks.length; i++) {
@@ -508,17 +813,28 @@ client.on(Events.MessageCreate, async message => {
     }
 
     await message.channel.sendTyping();
+    const conversationKey = getConversationKey({
+      guildId: message.guild.id,
+      channelId: message.channel.id,
+      userId: message.author.id,
+    });
+    const conversationHistory = getConversationHistory(conversationKey);
     const inferredSubject = inferSubjectFromPrompt(cleanedPrompt);
-    const profile = recordUserTopic(message.author.id, inferredSubject);
+    recordUserTopic(message.author.id, inferredSubject);
 
-    const text = await askAI({
+    const { text } = await askAI({
       prompt: cleanedPrompt,
       subject: inferredSubject,
       mentionMode: true,
+      userId: message.author.id,
+      conversationHistory,
     });
 
-    const chunks = chunkText(text);
-    await message.reply(personalizeReply(chunks[0], displayName, buildHistoryComment(inferredSubject, profile)));
+    const historyComment = '';
+    const firstChunkMaxLength = 1900 - getPersonalizedPrefixLength(displayName, historyComment);
+    const chunks = chunkText(text, Math.max(1200, firstChunkMaxLength));
+    await message.reply(personalizeReply(chunks[0], displayName, historyComment));
+    recordConversationTurn(conversationKey, cleanedPrompt, text);
 
     for (let i = 1; i < chunks.length; i++) {
       await message.channel.send(chunks[i]);
