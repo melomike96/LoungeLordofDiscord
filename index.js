@@ -24,6 +24,8 @@
 // - Mention mode gives you the natural chat feel you want.
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 
 const {
   Client,
@@ -58,8 +60,35 @@ const client = new Client({
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEFAULT_MODEL = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
 const SEARCH_MODEL = process.env.OPENAI_SEARCH_MODEL?.trim() || DEFAULT_MODEL;
+const USER_MEMORY_PATH = path.join(__dirname, 'user-memory.json');
 
 const SUBJECTS = ['general', 'history', 'science', 'tech', 'nutrition'];
+const SUBJECT_KEYWORDS = {
+  history: ['history', 'rome', 'empire', 'war', 'ancient', 'historian', 'civilization'],
+  science: ['science', 'physics', 'chemistry', 'biology', 'space', 'planet', 'atom'],
+  tech: ['tech', 'code', 'coding', 'programming', 'computer', 'ai', 'software'],
+  nutrition: ['nutrition', 'diet', 'protein', 'calorie', 'food', 'meal', 'vitamin'],
+};
+
+function loadUserMemory() {
+  try {
+    if (!fs.existsSync(USER_MEMORY_PATH)) return {};
+    return JSON.parse(fs.readFileSync(USER_MEMORY_PATH, 'utf8'));
+  } catch (error) {
+    console.error('Failed to load user memory:', error);
+    return {};
+  }
+}
+
+function saveUserMemory(memory) {
+  try {
+    fs.writeFileSync(USER_MEMORY_PATH, JSON.stringify(memory, null, 2));
+  } catch (error) {
+    console.error('Failed to save user memory:', error);
+  }
+}
+
+const userMemory = loadUserMemory();
 
 const commands = [
   new SlashCommandBuilder()
@@ -100,12 +129,12 @@ const commands = [
 
 function buildSystemPrompt(subject, isMentionMode = false) {
   const base = [
-    'You are LoungeLord, a smart, laid-back but sharp Discord expert assistant.',
-    'Answer like a knowledgeable guide, not a stiff textbook.',
-    'Be clear, accurate, and direct.',
-    'Start with a clean answer, then add useful nuance if needed.',
-    'Do not ramble.',
-    'If the user is casual, you can be casual too.',
+    'You are LoungeLord, a friendly, casual, sharp Discord assistant.',
+    'Sound warm, easygoing, and human.',
+    'Be clear, accurate, and helpful without sounding stiff.',
+    'Lead with the answer, then add useful nuance if it helps.',
+    'Keep it concise unless the user clearly wants more detail.',
+    'If the user is joking or casual, match that vibe naturally.',
     'If the question is ambiguous, make the best reasonable interpretation and answer it.',
     'If the topic touches medicine, diagnosis, or treatment, stay general and avoid pretending to be a doctor.',
   ];
@@ -120,10 +149,73 @@ function buildSystemPrompt(subject, isMentionMode = false) {
 
   if (isMentionMode) {
     base.push('When the user mentions you naturally, infer the best subject automatically from their message.');
+    base.push('Mention-mode replies should feel extra conversational, like a smart friend in the server.');
   }
 
   base.push(subjectRules[subject] || subjectRules.general);
   return base.join(' ');
+}
+
+function inferSubjectFromPrompt(prompt = '') {
+  const lower = prompt.toLowerCase();
+
+  for (const [subject, keywords] of Object.entries(SUBJECT_KEYWORDS)) {
+    if (keywords.some(keyword => lower.includes(keyword))) {
+      return subject;
+    }
+  }
+
+  return 'general';
+}
+
+function getDisplayName(user, member) {
+  return member?.displayName || user?.globalName || user?.username || 'there';
+}
+
+function getUserProfile(userId) {
+  if (!userMemory[userId]) {
+    userMemory[userId] = {
+      totalQuestions: 0,
+      subjects: {},
+    };
+  }
+
+  return userMemory[userId];
+}
+
+function recordUserTopic(userId, subject) {
+  const profile = getUserProfile(userId);
+  profile.totalQuestions += 1;
+  profile.subjects[subject] = (profile.subjects[subject] || 0) + 1;
+  saveUserMemory(userMemory);
+  return profile;
+}
+
+function buildHistoryComment(subject, profile) {
+  const count = profile.subjects[subject] || 0;
+
+  if (count < 2) return '';
+
+  const lines = {
+    history: 'You really are a curious historian at this point.',
+    science: 'You always come back with a good science question.',
+    tech: 'You are definitely the tech one in here.',
+    nutrition: 'You have been on a real nutrition streak lately.',
+    general: 'You always bring in something interesting.',
+  };
+
+  return lines[subject] || lines.general;
+}
+
+function personalizeReply(text, displayName, historyComment = '') {
+  const greeting = `Hey ${displayName}`;
+  const trimmed = text.trim();
+
+  if (!historyComment) {
+    return `${greeting}, ${trimmed}`;
+  }
+
+  return `${greeting} - ${historyComment} ${trimmed}`;
 }
 
 function chunkText(text, maxLength = 1900) {
@@ -179,6 +271,50 @@ function getUserFacingErrorMessage(error, context = 'request') {
   }
 
   return `Something broke while handling that ${context}. Check the bot logs for details.`;
+}
+
+function isUnknownInteractionError(error) {
+  return error?.code === 10062 || /Unknown interaction/i.test(error?.message || '');
+}
+
+async function safeDeferReply(interaction, options) {
+  try {
+    await interaction.deferReply(options);
+    return true;
+  } catch (error) {
+    if (isUnknownInteractionError(error)) {
+      console.error('Interaction expired before deferReply:', error);
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+async function safeEditReply(interaction, content) {
+  try {
+    await interaction.editReply(content);
+  } catch (error) {
+    if (isUnknownInteractionError(error)) {
+      console.error('Interaction expired before editReply:', error);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function safeFollowUp(interaction, content) {
+  try {
+    await interaction.followUp(content);
+  } catch (error) {
+    if (isUnknownInteractionError(error)) {
+      console.error('Interaction expired before followUp:', error);
+      return;
+    }
+
+    throw error;
+  }
 }
 
 async function checkOpenAIHealth() {
@@ -237,7 +373,7 @@ async function searchAI(prompt) {
         content: [
           'You are LoungeLord handling a Discord web lookup.',
           'Search the web for current information.',
-          'Answer directly and briefly.',
+          'Answer directly, casually, and clearly.',
           'When using web results, include source links inline so the user can verify the answer.',
           'If the answer is uncertain or mixed, say so plainly.',
         ].join(' '),
@@ -279,11 +415,16 @@ client.once(Events.ClientReady, readyClient => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 });
 
+client.on('error', error => {
+  console.error('Discord client error:', error);
+});
+
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === 'health') {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const deferred = await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral });
+    if (!deferred) return;
 
     const openaiHealth = await checkOpenAIHealth();
     const lines = [
@@ -293,26 +434,30 @@ client.on(Events.InteractionCreate, async interaction => {
       openaiHealth.ok ? openaiHealth.message : `OpenAI check failed: ${openaiHealth.message}`,
     ];
 
-    await interaction.editReply(lines.join('\n'));
+    await safeEditReply(interaction, lines.join('\n'));
     return;
   }
 
   if (interaction.commandName === 'search') {
     const prompt = interaction.options.getString('prompt', true);
+    const displayName = getDisplayName(interaction.user, interaction.member);
+    const profile = recordUserTopic(interaction.user.id, 'general');
 
-    await interaction.deferReply();
+    const deferred = await safeDeferReply(interaction);
+    if (!deferred) return;
 
     try {
       const text = await searchAI(prompt);
       const chunks = chunkText(text);
+      const firstChunk = personalizeReply(chunks[0], displayName, buildHistoryComment('general', profile));
 
-      await interaction.editReply(chunks[0]);
+      await safeEditReply(interaction, firstChunk);
       for (let i = 1; i < chunks.length; i++) {
-        await interaction.followUp(chunks[i]);
+        await safeFollowUp(interaction, chunks[i]);
       }
     } catch (error) {
       console.error('Search command error:', error);
-      await interaction.editReply(getUserFacingErrorMessage(error, 'search command'));
+      await safeEditReply(interaction, getUserFacingErrorMessage(error, 'search command'));
     }
     return;
   }
@@ -321,20 +466,24 @@ client.on(Events.InteractionCreate, async interaction => {
 
   const subject = interaction.options.getString('subject', true);
   const prompt = interaction.options.getString('prompt', true);
+  const displayName = getDisplayName(interaction.user, interaction.member);
+  const profile = recordUserTopic(interaction.user.id, subject);
 
-  await interaction.deferReply();
+  const deferred = await safeDeferReply(interaction);
+  if (!deferred) return;
 
   try {
     const text = await askAI({ prompt, subject, mentionMode: false });
     const chunks = chunkText(text);
+    const firstChunk = personalizeReply(chunks[0], displayName, buildHistoryComment(subject, profile));
 
-    await interaction.editReply(chunks[0]);
+    await safeEditReply(interaction, firstChunk);
     for (let i = 1; i < chunks.length; i++) {
-      await interaction.followUp(chunks[i]);
+      await safeFollowUp(interaction, chunks[i]);
     }
   } catch (error) {
     console.error('Slash command error:', error);
-    await interaction.editReply(getUserFacingErrorMessage(error, 'slash command'));
+    await safeEditReply(interaction, getUserFacingErrorMessage(error, 'slash command'));
   }
 });
 
@@ -349,22 +498,27 @@ client.on(Events.MessageCreate, async message => {
 
     const botMentionRegex = new RegExp(`<@!?${client.user.id}>`, 'g');
     const cleanedPrompt = message.content.replace(botMentionRegex, '').trim();
+    const displayName = getDisplayName(message.author, message.member);
 
     if (!cleanedPrompt) {
-      await message.reply('Hit me with a real question. Example: @LoungeLord why did Rome fall?');
+      await message.reply(
+        `Hey ${displayName}, I'm here. Ask me anything, toss me a random idea, or use \`/search\` if you want me to look something up.`
+      );
       return;
     }
 
     await message.channel.sendTyping();
+    const inferredSubject = inferSubjectFromPrompt(cleanedPrompt);
+    const profile = recordUserTopic(message.author.id, inferredSubject);
 
     const text = await askAI({
       prompt: cleanedPrompt,
-      subject: 'general',
+      subject: inferredSubject,
       mentionMode: true,
     });
 
     const chunks = chunkText(text);
-    await message.reply(chunks[0]);
+    await message.reply(personalizeReply(chunks[0], displayName, buildHistoryComment(inferredSubject, profile)));
 
     for (let i = 1; i < chunks.length; i++) {
       await message.channel.send(chunks[i]);
@@ -395,3 +549,11 @@ client.on(Events.MessageCreate, async message => {
     console.error('Startup failed:', error);
   }
 })();
+
+process.on('unhandledRejection', error => {
+  console.error('Unhandled rejection:', error);
+});
+
+process.on('uncaughtException', error => {
+  console.error('Uncaught exception:', error);
+});
